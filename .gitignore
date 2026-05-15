@@ -1,0 +1,4 @@
+chest_xray/
+__MACOSX/
+.DS_Store
+*.pth
