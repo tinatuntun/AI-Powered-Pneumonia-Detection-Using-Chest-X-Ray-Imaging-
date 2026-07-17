@@ -1,0 +1,742 @@
+import os
+import random
+import imageio.v2 as imageio
+import numpy as np
+import matplotlib.pyplot as plt
+import scipy.ndimage as ndi
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+from sklearn.metrics import accuracy_score, precision_score, recall_score
+from sklearn.metrics import confusion_matrix, classification_report
+from skimage.filters import threshold_otsu
+
+
+DATASET_PATH = os.getenv("CHEST_XRAY_DATASET", "data/chest_xray")
+IMG_SIZE = 128
+EPOCHS = 10
+BATCH_SIZE = 32
+LEARNING_RATE = 0.001
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def read_image(path):
+    im = imageio.imread(path)
+
+    if len(im.shape) == 3:
+        im = im[:, :, 0] * 0.299 + im[:, :, 1] * 0.587 + im[:, :, 2] * 0.114
+
+    im = im.astype("float32")
+    return im
+
+def resize_image(im, size=128):
+    zoom0 = size / im.shape[0]
+    zoom1 = size / im.shape[1]
+    im_resized = ndi.zoom(im, zoom=(zoom0, zoom1))
+    return im_resized
+
+def normalize_image(im):
+    min_value = im.min()
+    max_value = im.max()
+
+    if max_value - min_value == 0:
+        return im
+
+    im_norm = (im - min_value) / (max_value - min_value)
+    return im_norm
+
+def preprocess_image(im):
+   
+    im_norm = normalize_image(im)
+    im_smooth = ndi.gaussian_filter(im_norm, sigma=0.7)
+    p2 = np.percentile(im_smooth, 2)
+    p98 = np.percentile(im_smooth, 98)
+    im_contrast = (im_smooth - p2) / (p98 - p2)
+    im_contrast = np.clip(im_contrast, 0, 1)
+    blur = ndi.gaussian_filter(im_contrast, sigma=1)
+    im_sharp = im_contrast + 0.5 * (im_contrast - blur)
+    im_sharp = np.clip(im_sharp, 0, 1)
+    threshold = im_smooth.mean()
+    mask_start = im_smooth > threshold
+    mask_closed = ndi.binary_closing(mask_start)
+    mask_filled = ndi.binary_fill_holes(mask_closed)
+    labels, nlabels = ndi.label(mask_filled)
+    if nlabels > 0:
+        areas = ndi.sum(mask_filled, labels, index=range(1, nlabels + 1))
+        largest_label = np.argmax(areas) + 1
+        mask_roi = labels == largest_label
+    else:
+        mask_roi = mask_filled
+
+    im_preprocessed = im_sharp
+
+    return im_preprocessed, mask_roi, labels
+
+def extract_features(im, mask):
+    area = np.sum(mask)
+
+    if area > 0:
+        mean_intensity = ndi.mean(im, mask)
+    else:
+        mean_intensity = 0
+
+    return mean_intensity, area
+
+def load_split(dataset_path, split_name, class_names, img_size=128):
+    X_raw = []
+    X_preprocessed = []
+    y = []
+    features_table = []
+    image_paths = []
+
+    split_path = os.path.join(dataset_path, split_name)
+
+    for label_index, class_name in enumerate(class_names):
+        class_path = os.path.join(split_path, class_name)
+
+        if not os.path.exists(class_path):
+            print("Missing folder:", class_path)
+            continue
+
+        for file_name in os.listdir(class_path):
+            if file_name.lower().endswith((".png", ".jpg", ".jpeg", ".bmp")):
+                path = os.path.join(class_path, file_name)
+
+                im = read_image(path)
+                im_resized = resize_image(im, img_size)
+                im_norm = normalize_image(im_resized)
+
+                im_segmented, mask, labels_img = preprocess_image(im_resized)
+
+                mean_intensity, area = extract_features(im_norm, mask)
+
+                X_raw.append(im_norm)
+                X_preprocessed.append(im_segmented)
+                y.append(label_index)
+                features_table.append([mean_intensity, area, label_index])
+                image_paths.append(path)
+
+    X_raw = np.array(X_raw)
+    X_preprocessed = np.array(X_preprocessed)
+    y = np.array(y)
+    features_table = np.array(features_table)
+
+    return X_raw, X_preprocessed, y, features_table, image_paths
+
+
+class_names = ["NORMAL", "PNEUMONIA"]
+
+print("\nClasses:")
+print(class_names)
+
+#  load data 
+
+X_raw_train, X_pre_train, y_train, features_train, train_paths = load_split(
+    DATASET_PATH, "train", class_names, IMG_SIZE
+)
+
+X_raw_val, X_pre_val, y_val, features_val, val_paths = load_split(
+    DATASET_PATH, "val", class_names, IMG_SIZE
+)
+
+X_raw_test, X_pre_test, y_test, features_test, test_paths = load_split(
+    DATASET_PATH, "test", class_names, IMG_SIZE
+)
+
+if len(train_paths) == 0 or len(test_paths) == 0:
+    raise SystemExit(
+        "Chest X-ray dataset not found or empty. "
+        "Place images under data/chest_xray/{train,val,test}/{NORMAL,PNEUMONIA} "
+        "or set CHEST_XRAY_DATASET to the dataset folder."
+    )
+
+print("\nDataset Loaded Successfully")
+print("Raw Train Shape:", X_raw_train.shape)
+print("Raw Val Shape:", X_raw_val.shape)
+print("Raw Test Shape:", X_raw_test.shape)
+
+print("\nTrain Class Count:")
+for i, name in enumerate(class_names):
+    print(name, ":", np.sum(y_train == i))
+
+print("\nValidation Class Count:")
+for i, name in enumerate(class_names):
+    print(name, ":", np.sum(y_val == i))
+
+print("\nTest Class Count:")
+for i, name in enumerate(class_names):
+    print(name, ":", np.sum(y_test == i))
+
+
+
+print(" DATASET EXPLORATION")
+
+
+sample_paths = random.sample(train_paths, min(6, len(train_paths)))
+
+fig, axes = plt.subplots(2, 3, figsize=(12, 8))
+axes = axes.ravel()
+
+for i in range(len(sample_paths)):
+    im = read_image(sample_paths[i])
+    label_name = os.path.basename(os.path.dirname(sample_paths[i]))
+
+    axes[i].imshow(im, cmap="gray")
+    axes[i].set_title(label_name)
+    axes[i].axis("off")
+
+plt.suptitle("Sample Images from Training Dataset")
+plt.show()
+
+
+
+sample_im = read_image(sample_paths[0])
+
+print("\nSample Image Information")
+print("Image Shape:", sample_im.shape)
+print("Data Type:", sample_im.dtype)
+print("Minimum Intensity:", sample_im.min())
+print("Maximum Intensity:", sample_im.max())
+print("Mean Intensity:", sample_im.mean())
+
+plt.figure(figsize=(6, 5))
+plt.imshow(sample_im, cmap="gray")
+plt.title("Original Sample Image")
+plt.axis("off")
+plt.colorbar()
+plt.show()
+
+hist = ndi.histogram(sample_im, min=sample_im.min(), max=sample_im.max(), bins=256)
+
+plt.figure(figsize=(7, 5))
+plt.plot(hist)
+plt.title("Histogram of Pixel Intensities")
+plt.xlabel("Intensity Value")
+plt.ylabel("Number of Pixels")
+plt.show()
+
+
+
+sample_norm = normalize_image(sample_im)
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+
+axes[0].imshow(sample_im, cmap="gray")
+axes[0].set_title("Original Image")
+axes[0].axis("off")
+
+axes[1].imshow(sample_norm, cmap="gray", vmin=0, vmax=1)
+axes[1].set_title("Normalized Image")
+axes[1].axis("off")
+
+plt.suptitle("Before and After Normalization")
+plt.show()
+
+
+
+sample_smooth = ndi.gaussian_filter(sample_norm, sigma=1)
+
+sobel_ax0 = ndi.sobel(sample_norm, axis=0)
+sobel_ax1 = ndi.sobel(sample_norm, axis=1)
+
+sample_edges = np.sqrt(np.square(sobel_ax0) + np.square(sobel_ax1))
+
+sample_edges = normalize_image(sample_edges)
+
+sample_edges = np.power(sample_edges, 0.5)
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+axes[0].imshow(sample_norm, cmap="gray")
+axes[0].set_title("Original Normalized")
+axes[0].axis("off")
+
+axes[1].imshow(sample_smooth, cmap="gray")
+axes[1].set_title("Gaussian Smoothing")
+axes[1].axis("off")
+
+axes[2].imshow(sample_edges, cmap="hot", vmin=0, vmax=1)
+axes[2].set_title("Sobel Edge Detection")
+axes[2].axis("off")
+
+plt.suptitle("Image Enhancement and Edge Detection")
+plt.show()
+
+
+
+gaussian_img = ndi.gaussian_filter(sample_norm, sigma=1)
+
+mean_kernel = np.ones((3, 3)) / 9
+mean_img = ndi.convolve(sample_norm, mean_kernel)
+
+median_img = ndi.median_filter(sample_norm, size=3)
+
+
+
+sobel_x = ndi.sobel(sample_norm, axis=0)
+sobel_y = ndi.sobel(sample_norm, axis=1)
+sobel_edges = np.sqrt(np.square(sobel_x) + np.square(sobel_y))
+sobel_edges = normalize_image(sobel_edges)
+sobel_edges = np.power(sobel_edges, 0.5)
+
+
+prewitt_x = ndi.prewitt(sample_norm, axis=0)
+prewitt_y = ndi.prewitt(sample_norm, axis=1)
+prewitt_edges = np.sqrt(np.square(prewitt_x) + np.square(prewitt_y))
+prewitt_edges = normalize_image(prewitt_edges)
+prewitt_edges = np.power(prewitt_edges, 0.5)
+
+
+laplacian_edges = ndi.laplace(sample_norm)
+laplacian_edges = np.abs(laplacian_edges)
+laplacian_edges = normalize_image(laplacian_edges)
+laplacian_edges = np.power(laplacian_edges, 0.5)
+
+
+fig, axes = plt.subplots(1, 4, figsize=(18, 5))
+
+axes[0].imshow(sample_norm, cmap="gray")
+axes[0].set_title("Original Normalized")
+axes[0].axis("off")
+
+axes[1].imshow(gaussian_img, cmap="gray")
+axes[1].set_title("Gaussian Filter")
+axes[1].axis("off")
+
+axes[2].imshow(mean_img, cmap="gray")
+axes[2].set_title("Mean Filter")
+axes[2].axis("off")
+
+axes[3].imshow(median_img, cmap="gray")
+axes[3].set_title("Median Filter")
+axes[3].axis("off")
+
+plt.suptitle("Smoothing Filter Comparison")
+plt.show()
+
+
+
+fig, axes = plt.subplots(1, 4, figsize=(18, 5))
+
+axes[0].imshow(sample_norm, cmap="gray")
+axes[0].set_title("Original Normalized")
+axes[0].axis("off")
+
+axes[1].imshow(sobel_edges, cmap="gray", vmin=0, vmax=1)
+axes[1].set_title("Sobel Edge Detection")
+axes[1].axis("off")
+
+axes[2].imshow(prewitt_edges, cmap="gray", vmin=0, vmax=1)
+axes[2].set_title("Prewitt Edge Detection")
+axes[2].axis("off")
+
+axes[3].imshow(laplacian_edges, cmap="gray", vmin=0, vmax=1)
+axes[3].set_title("Laplacian Edge Detection")
+axes[3].axis("off")
+
+plt.suptitle("Edge Detection Comparison")
+plt.show()
+
+
+sample_segmented, sample_mask, sample_labels = preprocess_image(sample_im)
+
+fig, axes = plt.subplots(1, 4, figsize=(18, 5))
+
+axes[0].imshow(sample_norm, cmap="gray")
+axes[0].set_title("Original")
+axes[0].axis("off")
+
+axes[1].imshow(sample_smooth, cmap="gray")
+axes[1].set_title("Smoothed")
+axes[1].axis("off")
+
+axes[2].imshow(sample_mask, cmap="gray")
+axes[2].set_title("Mask")
+axes[2].axis("off")
+
+axes[3].imshow(sample_segmented, cmap="gray")
+axes[3].set_title("Segmented ROI")
+axes[3].axis("off")
+
+plt.suptitle("Masking and Segmentation")
+plt.show()
+
+
+
+im_for_mask = ndi.gaussian_filter(sample_norm, sigma=1)
+
+
+mean_threshold = im_for_mask.mean()
+mask_mean = im_for_mask > mean_threshold
+mask_mean = ndi.binary_closing(mask_mean)
+mask_mean = ndi.binary_fill_holes(mask_mean)
+
+seg_mean = np.where(mask_mean, sample_norm, 0)
+
+
+percentile_threshold = np.percentile(im_for_mask, 60)
+mask_percentile = im_for_mask > percentile_threshold
+mask_percentile = ndi.binary_closing(mask_percentile)
+mask_percentile = ndi.binary_fill_holes(mask_percentile)
+
+seg_percentile = np.where(mask_percentile, sample_norm, 0)
+
+
+
+otsu_threshold = threshold_otsu(im_for_mask)
+mask_otsu = im_for_mask > otsu_threshold
+mask_otsu = ndi.binary_closing(mask_otsu)
+mask_otsu = ndi.binary_fill_holes(mask_otsu)
+
+seg_otsu = np.where(mask_otsu, sample_norm, 0)
+
+
+
+fig, axes = plt.subplots(1, 4, figsize=(18, 5))
+
+axes[0].imshow(sample_norm, cmap="gray")
+axes[0].set_title("Original Normalized")
+axes[0].axis("off")
+
+axes[1].imshow(mask_mean, cmap="gray")
+axes[1].set_title("Mean Threshold Mask")
+axes[1].axis("off")
+
+axes[2].imshow(mask_percentile, cmap="gray")
+axes[2].set_title("Percentile Mask")
+axes[2].axis("off")
+
+axes[3].imshow(mask_otsu, cmap="gray")
+axes[3].set_title("Otsu Mask")
+axes[3].axis("off")
+
+plt.suptitle("Masking Methods Comparison")
+plt.show()
+
+
+
+fig, axes = plt.subplots(1, 4, figsize=(18, 5))
+
+axes[0].imshow(sample_norm, cmap="gray")
+axes[0].set_title("Original Normalized")
+axes[0].axis("off")
+
+axes[1].imshow(seg_mean, cmap="gray")
+axes[1].set_title("Mean Threshold Segmentation")
+axes[1].axis("off")
+
+axes[2].imshow(seg_percentile, cmap="gray")
+axes[2].set_title("Percentile Segmentation")
+axes[2].axis("off")
+
+axes[3].imshow(seg_otsu, cmap="gray")
+axes[3].set_title("Otsu Segmentation")
+axes[3].axis("off")
+
+plt.suptitle("Segmentation Methods Comparison")
+plt.show()
+
+
+
+mean_intensity_mean, area_mean = extract_features(sample_norm, mask_mean)
+mean_intensity_percentile, area_percentile = extract_features(sample_norm, mask_percentile)
+mean_intensity_otsu, area_otsu = extract_features(sample_norm, mask_otsu)
+
+
+
+mean_intensity, area = extract_features(sample_norm, sample_mask)
+
+
+
+
+plt.figure(figsize=(7, 5))
+plt.scatter(features_train[:, 0], features_train[:, 1], c=features_train[:, 2])
+plt.title("Extracted Features from Training Images")
+plt.xlabel("Mean Intensity")
+plt.ylabel("Area")
+plt.show()
+
+# Convert Data to PyTorch Format
+def convert_to_tensor(X, y):
+    X_t = torch.tensor(X, dtype=torch.float32).unsqueeze(1)
+    y_t = torch.tensor(y, dtype=torch.long)
+    return X_t, y_t
+
+X_raw_train_t, y_train_t = convert_to_tensor(X_raw_train, y_train)
+X_raw_val_t, y_val_t = convert_to_tensor(X_raw_val, y_val)
+X_raw_test_t, y_test_t = convert_to_tensor(X_raw_test, y_test)
+
+X_pre_train_t, y_train2_t = convert_to_tensor(X_pre_train, y_train)
+X_pre_val_t, y_val2_t = convert_to_tensor(X_pre_val, y_val)
+X_pre_test_t, y_test2_t = convert_to_tensor(X_pre_test, y_test)
+
+raw_train_loader = DataLoader(TensorDataset(X_raw_train_t, y_train_t), batch_size=BATCH_SIZE, shuffle=True)
+raw_val_loader = DataLoader(TensorDataset(X_raw_val_t, y_val_t), batch_size=BATCH_SIZE, shuffle=False)
+raw_test_loader = DataLoader(TensorDataset(X_raw_test_t, y_test_t), batch_size=BATCH_SIZE, shuffle=False)
+
+pre_train_loader = DataLoader(TensorDataset(X_pre_train_t, y_train2_t), batch_size=BATCH_SIZE, shuffle=True)
+pre_val_loader = DataLoader(TensorDataset(X_pre_val_t, y_val2_t), batch_size=BATCH_SIZE, shuffle=False)
+pre_test_loader = DataLoader(TensorDataset(X_pre_test_t, y_test2_t), batch_size=BATCH_SIZE, shuffle=False)
+
+print("\nData Converted to PyTorch Format Successfully")
+print("Raw Train Tensor:", X_raw_train_t.shape)
+print("Preprocessed Train Tensor:", X_pre_train_t.shape)
+
+
+
+class CNN_Model(nn.Module):
+    def __init__(self, number_of_classes):
+        super(CNN_Model, self).__init__()
+
+        self.conv1 = nn.Conv2d(1, 16, kernel_size=3)
+        self.relu1 = nn.ReLU()
+        self.pool1 = nn.MaxPool2d(2, 2)
+
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3)
+        self.relu2 = nn.ReLU()
+        self.pool2 = nn.MaxPool2d(2, 2)
+
+        self.conv3 = nn.Conv2d(32, 64, kernel_size=3)
+        self.relu3 = nn.ReLU()
+        self.pool3 = nn.MaxPool2d(2, 2)
+
+        self.flatten = nn.Flatten()
+
+        self.fc1 = nn.Linear(64 * 14 * 14, 64)
+        self.relu4 = nn.ReLU()
+        self.dropout = nn.Dropout(0.3)
+
+        self.fc2 = nn.Linear(64, number_of_classes)
+
+    def forward(self, x):
+        x = self.pool1(self.relu1(self.conv1(x)))
+        x = self.pool2(self.relu2(self.conv2(x)))
+        x = self.pool3(self.relu3(self.conv3(x)))
+
+        x = self.flatten(x)
+
+        x = self.relu4(self.fc1(x))
+        x = self.dropout(x)
+
+        x = self.fc2(x)
+
+        return x
+
+
+number_of_classes = len(class_names)
+
+print("\nCNN Architecture:")
+print("Conv2D 1 -> ReLU -> MaxPool")
+print("Conv2D 2 -> ReLU -> MaxPool")
+print("Conv2D 3 -> ReLU -> MaxPool")
+print("Flatten -> Dense -> ReLU -> Dropout -> Output")
+print("Loss Function: CrossEntropyLoss")
+print("Optimizer: Adam")
+
+# Training 
+
+def train_model(model, train_loader, val_loader, experiment_name):
+    model = model.to(device)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+    train_accuracy_history = []
+    val_accuracy_history = []
+
+    print("\n" + "=" * 70)
+    print(experiment_name)
+    print("=" * 70)
+
+    for epoch in range(EPOCHS):
+        model.train()
+
+        running_loss = 0
+        correct = 0
+        total = 0
+
+        for images, labels in train_loader:
+            images = images.to(device)
+            labels = labels.to(device)
+
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            running_loss = running_loss + loss.item()
+
+            predicted = torch.argmax(outputs, dim=1)
+            total = total + labels.size(0)
+            correct = correct + (predicted == labels).sum().item()
+
+        train_accuracy = correct / total
+        train_accuracy_history.append(train_accuracy)
+
+        model.eval()
+        val_correct = 0
+        val_total = 0
+
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images = images.to(device)
+                labels = labels.to(device)
+
+                outputs = model(images)
+                predicted = torch.argmax(outputs, dim=1)
+
+                val_total = val_total + labels.size(0)
+                val_correct = val_correct + (predicted == labels).sum().item()
+
+        val_accuracy = val_correct / val_total
+        val_accuracy_history.append(val_accuracy)
+
+        print("Epoch", epoch + 1, "/", EPOCHS,
+              "- Loss:", round(running_loss, 4),
+              "- Train Accuracy:", round(train_accuracy, 4),
+              "- Val Accuracy:", round(val_accuracy, 4))
+
+    return model, train_accuracy_history, val_accuracy_history
+
+
+def evaluate_model(model, test_loader, y_true, experiment_name):
+    model.eval()
+
+    all_predictions = []
+
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images = images.to(device)
+
+            outputs = model(images)
+            predicted = torch.argmax(outputs, dim=1)
+
+            all_predictions.extend(predicted.cpu().numpy())
+
+    y_pred = np.array(all_predictions)
+
+    acc = accuracy_score(y_true, y_pred)
+    prec = precision_score(y_true, y_pred, average="weighted", zero_division=0)
+    rec = recall_score(y_true, y_pred, average="weighted", zero_division=0)
+    cm = confusion_matrix(y_true, y_pred)
+
+    print("\n" + "=" * 70)
+    print(experiment_name)
+    print("=" * 70)
+    print("Accuracy:", round(acc, 4))
+    print("Precision:", round(prec, 4))
+    print("Recall:", round(rec, 4))
+
+    print("\nConfusion Matrix:")
+    print(cm)
+
+    print("\nClassification Report:")
+    print(classification_report(y_true, y_pred, target_names=class_names, zero_division=0))
+
+    plt.figure(figsize=(6, 5))
+    plt.imshow(cm, cmap="Blues")
+    plt.title(experiment_name + " - Confusion Matrix")
+    plt.xlabel("Predicted Label")
+    plt.ylabel("True Label")
+    plt.colorbar()
+
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            plt.text(j, i, cm[i, j], ha="center", va="center")
+
+    plt.xticks(range(len(class_names)), class_names, rotation=45)
+    plt.yticks(range(len(class_names)), class_names)
+    plt.show()
+
+    return acc, prec, rec, cm
+
+#  CNN 
+
+model_raw = CNN_Model(number_of_classes)
+
+model_raw, raw_train_history, raw_val_history = train_model(
+    model_raw,
+    raw_train_loader,
+    raw_val_loader,
+    "CNN TRAINING ON RAW IMAGES"
+)
+
+raw_acc, raw_prec, raw_rec, raw_cm = evaluate_model(
+    model_raw,
+    raw_test_loader,
+    y_test,
+    "RAW IMAGES CNN RESULTS"
+)
+
+
+model_pre = CNN_Model(number_of_classes)
+
+model_pre, pre_train_history, pre_val_history = train_model(
+    model_pre,
+    pre_train_loader,
+    pre_val_loader,
+    "CNN TRAINING ON PREPROCESSED IMAGES"
+)
+
+pre_acc, pre_prec, pre_rec, pre_cm = evaluate_model(
+    model_pre,
+    pre_test_loader,
+    y_test,
+    "PREPROCESSED IMAGES CNN RESULTS"
+)
+
+
+
+plt.figure(figsize=(8, 5))
+plt.plot(raw_train_history, label="Raw Train Accuracy")
+plt.plot(raw_val_history, label="Raw Val Accuracy")
+plt.plot(pre_train_history, label="Preprocessed Train Accuracy")
+plt.plot(pre_val_history, label="Preprocessed Val Accuracy")
+plt.title("CNN Accuracy Comparison")
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
+plt.legend()
+plt.show()
+
+
+
+print("\n" + "=" * 70)
+print("FINAL COMPARISON TABLE")
+print("=" * 70)
+
+print("{:<25} {:<12} {:<12} {:<12}".format(
+    "Experiment", "Accuracy", "Precision", "Recall"
+))
+print("-" * 70)
+
+print("{:<25} {:<12} {:<12} {:<12}".format(
+    "Raw Images",
+    round(raw_acc, 4),
+    round(raw_prec, 4),
+    round(raw_rec, 4)
+))
+
+print("{:<25} {:<12} {:<12} {:<12}".format(
+    "Preprocessed Images",
+    round(pre_acc, 4),
+    round(pre_prec, 4),
+    round(pre_rec, 4)
+))
+
+print("Interpretation:")
+
+if pre_acc > raw_acc:
+    print("Preprocessed images achieved better accuracy")
+elif pre_acc < raw_acc:
+    print("Raw images achieved better accuracy")
+else:
+    print("Both experiments achieved similar accuracy")
+    
+
+
+torch.save(model_raw.state_dict(), "cnn_raw_images_pytorch.pth")
+torch.save(model_pre.state_dict(), "cnn_preprocessed_images_pytorch.pth")
+
+print("Models Saved Successfully")
